@@ -1,342 +1,509 @@
 import os
-import re
-import asyncio
 import time
-from dataclasses import dataclass, field
+import asyncio
+from dataclasses import dataclass
 from typing import Dict, Optional
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
     ContextTypes,
+    ConversationHandler,
     filters,
 )
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-GROUP_CHAT_ID = int(os.getenv("GROUP_CHAT_ID", "0"))  # группа, куда постим запросы
-REQUEST_TTL_SECONDS = int(os.getenv("REQUEST_TTL_SECONDS", str(48 * 3600)))
-BOT_USERNAME = os.getenv("BOT_USERNAME", "").strip().lstrip("@")  # например Real_Flat_Bot
+# =========================
+# ENV
+# =========================
+BOT_TOKEN = os.getenv("BOT_TOKEN")  # НЕ вставляй токен в код
+BOT_USERNAME = (os.getenv("BOT_USERNAME") or "").lstrip("@")  # например: Real_Flat_Bot
+GROUP_CHAT_ID_RAW = os.getenv("GROUP_CHAT_ID")  # например: -5049595468
 
-ALLOWLIST_RAW = os.getenv("AGENTS_ALLOWLIST", "").strip()
-AGENTS_ALLOWLIST = {u.strip().lstrip("@").lower() for u in ALLOWLIST_RAW.split(",") if u.strip()}
+GROUP_CHAT_ID: Optional[int] = int(GROUP_CHAT_ID_RAW) if GROUP_CHAT_ID_RAW else None
 
+REQUEST_TTL_SECONDS = int(os.getenv("REQUEST_TTL_SECONDS", "172800"))  # 48 часов
+WATCH_INTERVAL_SECONDS = int(os.getenv("WATCH_INTERVAL_SECONDS", "600"))  # 10 минут
 
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is required (set it in Render Environment Variables)")
+
+# =========================
+# DATA
+# =========================
 @dataclass
 class Request:
-    rid: str
+    rid: int
     author_id: int
-    author_username: Optional[str]
+    author_username: str
     created_at: float
-    status: str = "active"  # active / closed
+    status: str = "active"  # active/closed
+    area: str = ""
+    budget: str = ""
+    rooms: str = ""
+    urgency: str = ""
+    pets: str = ""
+    taken_by_id: Optional[int] = None
+    taken_by_username: Optional[str] = None
     group_message_id: Optional[int] = None
-    data: Dict[str, str] = field(default_factory=dict)
+    last_ttl_prompt_at: float = 0.0
 
 
-REQUESTS: Dict[str, Request] = {}
-USER_STATE: Dict[int, Dict] = {}
-USER_ACTIVE_RID: Dict[int, str] = {}
-RID_COUNTER = 0
+REQUESTS: Dict[int, Request] = {}
+GROUP_MSG_TO_RID: Dict[int, int] = {}
+NEXT_RID = 1
+
+# Conversation states
+AREA, BUDGET, ROOMS, URGENCY, PETS, CONFIRM = range(6)
+
+# Callback prefixes
+CB_TAKE = "TAKE"
+CB_CLOSE = "CLOSE"
+CB_TTL_YES = "TTLYES"
+CB_TTL_NO = "TTLNO"
+CB_CONFIRM = "CONFIRM"
+CB_CANCEL = "CANCEL"
 
 
-def next_rid() -> str:
-    global RID_COUNTER
-    RID_COUNTER += 1
-    return f"R{RID_COUNTER:03d}"
-
-
-def is_allowed_agent(update: Update) -> bool:
-    if not AGENTS_ALLOWLIST:
-        return True
+# =========================
+# HELPERS
+# =========================
+def _user_tag(update: Update) -> str:
     u = update.effective_user
     if not u:
-        return False
-    return (u.username or "").lower() in AGENTS_ALLOWLIST
+        return "unknown"
+    return f"@{u.username}" if u.username else (u.first_name or "user")
 
 
-REQUEST_FIELDS = [
-    ("district", "Район? (например: Сабуртало)"),
-    ("budget", "Бюджет? (например: до $900)"),
-    ("rooms", "Комнаты? (например: 2к / 3к)"),
-    ("term", "Срок? (например: 12 мес)"),
-    ("viewing", "Когда смотреть? (например: сегодня/завтра)"),
-    ("comment", "Комментарий? (можно коротко)"),
-]
+def _next_rid() -> int:
+    global NEXT_RID
+    rid = NEXT_RID
+    NEXT_RID += 1
+    return rid
 
 
-def build_request_text(req: Request) -> str:
-    d = req.data
-    lines = [
-        f"🔎 ЗАПРОС #{req.rid}",
-    ]
-    if req.status == "closed":
-        lines.append("🟢 СТАТУС: ЗАКРЫТ")
-    lines += [
-        f"Район: {d.get('district','—')}",
-        f"Бюджет: {d.get('budget','—')}",
-        f"Комнаты: {d.get('rooms','—')}",
-        f"Срок: {d.get('term','—')}",
-        f"Смотреть: {d.get('viewing','—')}",
-        f"Комментарий: {d.get('comment','—')}",
-        "",
-        "⬇️ Нажми кнопку, чтобы отправить варианты автору (приватно).",
-    ]
-    return "\n".join(lines)
+def _request_text(r: Request) -> str:
+    taken = ""
+    if r.taken_by_username:
+        taken = f"\n👤 Взял: @{r.taken_by_username}"
+    elif r.taken_by_id:
+        taken = f"\n👤 Взял: {r.taken_by_id}"
+
+    return (
+        f"📌 Запрос #{r.rid}\n"
+        f"От: {r.author_username} (id {r.author_id})\n\n"
+        f"Районы: {r.area}\n"
+        f"Бюджет: {r.budget}\n"
+        f"Комнаты/спальни: {r.rooms}\n"
+        f"Срочность: {r.urgency}\n"
+        f"Животные: {r.pets}\n"
+        f"Статус: {r.status}"
+        f"{taken}\n\n"
+        f"➡️ Ответьте на это сообщение ссылками/вариантами — бот отправит их клиенту."
+    )
 
 
-def request_keyboard(req: Request) -> InlineKeyboardMarkup:
-    deep_link = f"https://t.me/{BOT_USERNAME}?start=reply_{req.rid}" if BOT_USERNAME else "https://t.me/"
-    kb = [
-        [InlineKeyboardButton("📩 Отправить вариант", url=deep_link)],
-        [InlineKeyboardButton("✅ Закрыть запрос", callback_data=f"close_{req.rid}")],
-    ]
-    return InlineKeyboardMarkup(kb)
+def _group_keyboard(rid: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("✅ Взять", callback_data=f"{CB_TAKE}:{rid}"),
+                InlineKeyboardButton("🛑 Закрыть", callback_data=f"{CB_CLOSE}:{rid}"),
+            ]
+        ]
+    )
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message:
-        return
-    u = update.effective_user
-    if not u:
-        return
+def _ttl_keyboard(rid: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("✅ Да, актуально", callback_data=f"{CB_TTL_YES}:{rid}"),
+                InlineKeyboardButton("🛑 Нет, закрыть", callback_data=f"{CB_TTL_NO}:{rid}"),
+            ]
+        ]
+    )
 
-    if context.args:
-        payload = context.args[0]
-        m = re.match(r"reply_(R\d+)", payload)
-        if m:
-            rid = m.group(1)
-            req = REQUESTS.get(rid)
-            if not req or req.status != "active":
-                await update.message.reply_text("Этот запрос уже закрыт или не найден.")
-                return
-            if not is_allowed_agent(update):
-                await update.message.reply_text("Доступ ограничен.")
-                return
-            USER_ACTIVE_RID[u.id] = rid
-            await update.message.reply_text(
-                f"Ок. Пришли ссылки для #{rid}.\n"
-                "Можно несколько сообщений подряд.\n"
-                "Когда закончил — напиши: ГОТОВО"
-            )
-            return
 
+# =========================
+# COMMANDS
+# =========================
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "Привет! Я бот Real Flats.\n\n"
-        "Команды:\n"
-        "/request — создать запрос (в личке)\n"
-        "/my — мои активные запросы\n"
-        "/help — помощь"
+        "Создать запрос: /request\n"
+        "Мои активные запросы: /my\n"
+        "Помощь: /help"
     )
 
 
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message:
-        return
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "Как пользоваться:\n"
-        "1) /request в личке — создаёшь запрос по форме\n"
-        "2) Я публикую запрос в группе\n"
-        "3) Агенты жмут «Отправить вариант» и кидают ссылки мне в личку\n"
-        "4) Я отправляю ссылки только автору запроса\n"
-        "5) Запрос живёт 48 часов или пока автор не закроет."
+        "/request — создать запрос\n"
+        "/my — посмотреть свои активные запросы\n"
+        "/close <id> — закрыть запрос\n"
+        "/ping — проверка"
     )
 
 
-async def request_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat and update.effective_chat.type != "private":
-        await update.message.reply_text("Создавай запрос в личке боту.")
-        return
-    if not is_allowed_agent(update):
-        await update.message.reply_text("Доступ ограничен.")
-        return
-
-    u = update.effective_user
-    rid = next_rid()
-    req = Request(rid=rid, author_id=u.id, author_username=u.username, created_at=time.time())
-    REQUESTS[rid] = req
-    USER_STATE[u.id] = {"mode": "request", "rid": rid, "step": 0}
-    await update.message.reply_text(f"Создаём запрос #{rid}.\n{REQUEST_FIELDS[0][1]}")
+async def ping_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text("pong ✅")
 
 
-async def my_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message:
-        return
-    u = update.effective_user
-    active = [r for r in REQUESTS.values() if r.author_id == u.id and r.status == "active"]
+async def my_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    uid = update.effective_user.id
+    active = [r for r in REQUESTS.values() if r.author_id == uid and r.status == "active"]
     if not active:
         await update.message.reply_text("У тебя нет активных запросов.")
         return
+
     lines = ["Твои активные запросы:"]
-    for r in active:
-        d = r.data
-        lines.append(f"• #{r.rid} — {d.get('district','—')} | {d.get('budget','—')} | {d.get('rooms','—')}")
+    for r in sorted(active, key=lambda x: x.rid):
+        lines.append(f"• #{r.rid} — {r.area} | {r.budget} | {r.rooms}")
     await update.message.reply_text("\n".join(lines))
 
 
-async def close_request(req: Request, context: ContextTypes.DEFAULT_TYPE):
-    if req.status == "closed":
+async def close_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.message.reply_text("Напиши так: /close 12")
         return
-    req.status = "closed"
-    if req.group_message_id:
+    try:
+        rid = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("ID должен быть числом. Пример: /close 12")
+        return
+
+    r = REQUESTS.get(rid)
+    if not r:
+        await update.message.reply_text("Такого запроса нет.")
+        return
+    if r.author_id != update.effective_user.id:
+        await update.message.reply_text("Ты не автор этого запроса.")
+        return
+
+    r.status = "closed"
+    await update.message.reply_text(f"Запрос #{rid} закрыт ✅")
+
+
+# =========================
+# REQUEST CONVERSATION
+# =========================
+async def request_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data["req"] = {}
+    await update.message.reply_text("Ок, начнём.\n\n1) Какие районы? (можно несколько)")
+    return AREA
+
+
+async def request_area(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data["req"]["area"] = (update.message.text or "").strip()
+    await update.message.reply_text("2) Бюджет? (например: $800–1200)")
+    return BUDGET
+
+
+async def request_budget(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data["req"]["budget"] = (update.message.text or "").strip()
+    await update.message.reply_text("3) Комнаты/спальни? (например: 2к / 1 спальня)")
+    return ROOMS
+
+
+async def request_rooms(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data["req"]["rooms"] = (update.message.text or "").strip()
+    await update.message.reply_text("4) Срочность? (когда нужно заехать / когда заканчивается договор)")
+    return URGENCY
+
+
+async def request_urgency(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data["req"]["urgency"] = (update.message.text or "").strip()
+    await update.message.reply_text("5) Животные? (нет / да, кто?)")
+    return PETS
+
+
+async def request_pets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data["req"]["pets"] = (update.message.text or "").strip()
+
+    data = context.user_data.get("req", {})
+    preview = (
+        "Проверь, всё ок?\n\n"
+        f"Районы: {data.get('area','')}\n"
+        f"Бюджет: {data.get('budget','')}\n"
+        f"Комнаты/спальни: {data.get('rooms','')}\n"
+        f"Срочность: {data.get('urgency','')}\n"
+        f"Животные: {data.get('pets','')}\n"
+    )
+    kb = InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton("✅ Подтвердить", callback_data=f"{CB_CONFIRM}"),
+            InlineKeyboardButton("❌ Отмена", callback_data=f"{CB_CANCEL}"),
+        ]]
+    )
+    await update.message.reply_text(preview, reply_markup=kb)
+    return CONFIRM
+
+
+async def request_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == CB_CANCEL:
+        await query.edit_message_text("Ок, отменил. Если нужно — /request")
+        return ConversationHandler.END
+
+    data = context.user_data.get("req", {})
+    rid = _next_rid()
+    u = update.effective_user
+    author_username = f"@{u.username}" if u and u.username else (u.first_name if u else "user")
+
+    r = Request(
+        rid=rid,
+        author_id=u.id,
+        author_username=author_username,
+        created_at=time.time(),
+        area=data.get("area", ""),
+        budget=data.get("budget", ""),
+        rooms=data.get("rooms", ""),
+        urgency=data.get("urgency", ""),
+        pets=data.get("pets", ""),
+    )
+    REQUESTS[rid] = r
+
+    # Сообщение клиенту
+    await query.edit_message_text(f"Готово ✅ Запрос #{rid} создан. Жду варианты от агентов.")
+
+    # Пост в группу агентов
+    if GROUP_CHAT_ID:
         try:
-            await context.bot.edit_message_text(
+            msg = await context.bot.send_message(
                 chat_id=GROUP_CHAT_ID,
-                message_id=req.group_message_id,
-                text=build_request_text(req),
-                reply_markup=None,
-                disable_web_page_preview=True,
+                text=_request_text(r),
+                reply_markup=_group_keyboard(rid),
+            )
+            r.group_message_id = msg.message_id
+            GROUP_MSG_TO_RID[msg.message_id] = rid
+        except Exception as e:
+            # Не падаем, просто говорим клиенту
+            await context.bot.send_message(
+                chat_id=r.author_id,
+                text="⚠️ Не смог отправить запрос в группу агентов (проверь, что бот добавлен в группу и у него есть права)."
+            )
+
+    else:
+        await context.bot.send_message(
+            chat_id=r.author_id,
+            text="⚠️ GROUP_CHAT_ID не задан — я создал запрос, но не могу отправить его агентам. Добавь GROUP_CHAT_ID в Render."
+        )
+
+    return ConversationHandler.END
+
+
+async def request_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text("Ок, отменил. Если нужно — /request")
+    return ConversationHandler.END
+
+
+# =========================
+# GROUP HANDLING (агенты)
+# =========================
+async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_chat:
+        return
+    if GROUP_CHAT_ID is None or update.effective_chat.id != GROUP_CHAT_ID:
+        return
+
+    # Нужно, чтобы агент отвечал реплаем на сообщение запроса
+    if not update.message.reply_to_message:
+        return
+
+    parent_id = update.message.reply_to_message.message_id
+    rid = GROUP_MSG_TO_RID.get(parent_id)
+    if not rid:
+        # иногда редактируют/перепостят — попробуем вытащить по тексту
+        text = update.message.reply_to_message.text or ""
+        # "Запрос #12"
+        import re
+        m = re.search(r"#(\d+)", text)
+        if m:
+            rid = int(m.group(1))
+        else:
+            return
+
+    r = REQUESTS.get(rid)
+    if not r or r.status != "active":
+        await update.message.reply_text("Этот запрос уже закрыт/не найден.")
+        return
+
+    agent = update.effective_user
+    agent_tag = f"@{agent.username}" if agent and agent.username else (agent.first_name if agent else "agent")
+
+    try:
+        # Копируем сообщение агентa клиенту (без ссылки на группу)
+        await context.bot.copy_message(
+            chat_id=r.author_id,
+            from_chat_id=update.effective_chat.id,
+            message_id=update.message.message_id,
+        )
+        await update.message.reply_text(f"✅ Отправлено клиенту по запросу #{rid} ({agent_tag}). Можешь слать ещё.")
+    except Exception:
+        await update.message.reply_text("⚠️ Не смог отправить клиенту (возможно, он не нажал /start у бота).")
+
+
+# =========================
+# CALLBACKS (кнопки)
+# =========================
+async def callbacks_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query:
+        return
+    await query.answer()
+
+    data = query.data or ""
+    # CONFIRM/CANCEL обрабатывается ConversationHandler'ом
+    if data in (CB_CONFIRM, CB_CANCEL):
+        return
+
+    if ":" not in data:
+        return
+    prefix, rid_s = data.split(":", 1)
+    try:
+        rid = int(rid_s)
+    except ValueError:
+        return
+
+    r = REQUESTS.get(rid)
+    if not r:
+        await query.edit_message_text("Запрос не найден.")
+        return
+
+    # Взять / закрыть в группе
+    if prefix == CB_TAKE:
+        if r.status != "active":
+            await query.edit_message_text("Запрос уже закрыт.")
+            return
+        u = query.from_user
+        r.taken_by_id = u.id
+        r.taken_by_username = u.username or u.first_name
+        # обновим сообщение в группе
+        try:
+            await query.edit_message_text(_request_text(r), reply_markup=_group_keyboard(rid))
+        except Exception:
+            pass
+        # уведомим клиента
+        try:
+            await context.bot.send_message(
+                chat_id=r.author_id,
+                text=f"✅ Запрос #{rid} взял агент @{r.taken_by_username}. Скоро будут варианты.",
             )
         except Exception:
             pass
-    try:
-        await context.bot.send_message(req.author_id, f"🟢 Запрос #{req.rid} закрыт.")
-    except Exception:
-        pass
+        return
 
+    if prefix == CB_CLOSE:
+        r.status = "closed"
+        try:
+            await query.edit_message_text(_request_text(r))
+        except Exception:
+            pass
+        try:
+            await context.bot.send_message(chat_id=r.author_id, text=f"🛑 Запрос #{rid} закрыт.")
+        except Exception:
+            pass
+        return
 
-async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    if not q:
-        return
-    await q.answer()
-    m = re.match(r"close_(R\d+)", q.data or "")
-    if not m:
-        return
-    rid = m.group(1)
-    req = REQUESTS.get(rid)
-    if not req:
-        return
-    if update.effective_user and update.effective_user.id != req.author_id:
-        await q.answer("Закрыть может только автор.", show_alert=True)
-        return
-    await close_request(req, context)
-    try:
-        await q.edit_message_reply_markup(reply_markup=None)
-    except Exception:
-        pass
-
-
-async def handle_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message:
-        return
-    u = update.effective_user
-    if not u:
-        return
-    text = (update.message.text or "").strip()
-
-    st = USER_STATE.get(u.id)
-    if st and st.get("mode") == "request":
-        rid = st["rid"]
-        step = st["step"]
-        key, _ = REQUEST_FIELDS[step]
-        REQUESTS[rid].data[key] = text
-        step += 1
-        if step >= len(REQUEST_FIELDS):
-            USER_STATE.pop(u.id, None)
-            req = REQUESTS[rid]
-            msg = await context.bot.send_message(
-                chat_id=GROUP_CHAT_ID,
-                text=build_request_text(req),
-                reply_markup=request_keyboard(req),
-                disable_web_page_preview=True,
-            )
-            req.group_message_id = msg.message_id
-            await update.message.reply_text(f"Готово ✅ Запрос #{rid} опубликован в группе.")
+    # TTL buttons в личке клиента
+    if prefix == CB_TTL_YES:
+        if r.status != "active":
+            await query.edit_message_text("Этот запрос уже закрыт.")
             return
-        st["step"] = step
-        await update.message.reply_text(REQUEST_FIELDS[step][1])
+        # продлеваем: просто «обновим» created_at, чтобы отсчёт пошёл заново
+        r.created_at = time.time()
+        r.last_ttl_prompt_at = time.time()
+        await query.edit_message_text(f"Ок ✅ Продлил запрос #{rid} ещё на 48 часов.")
         return
 
-    rid = USER_ACTIVE_RID.get(u.id)
-    if rid:
-        req = REQUESTS.get(rid)
-        if not req or req.status != "active":
-            USER_ACTIVE_RID.pop(u.id, None)
-            await update.message.reply_text("Этот запрос уже закрыт.")
-            return
-
-        if text.lower() == "готово":
-            USER_ACTIVE_RID.pop(u.id, None)
-            await update.message.reply_text("Ок ✅ Отправка завершена.")
-            return
-
-        await context.bot.send_message(
-            chat_id=req.author_id,
-            text=f"🏠 Вариант по #{rid} от @{u.username or u.first_name}:\n{text}",
-            disable_web_page_preview=False,
-        )
-
-        await context.bot.send_message(
-            chat_id=GROUP_CHAT_ID,
-            text=f"✅ @{u.username or u.first_name} отправил вариант автору #{rid}",
-        )
-
-        await update.message.reply_text("Отправлено ✅ Скидывай ещё ссылки или напиши ГОТОВО.")
+    if prefix == CB_TTL_NO:
+        r.status = "closed"
+        await query.edit_message_text(f"Ок ✅ Закрыл запрос #{rid}.")
         return
 
-    await update.message.reply_text("Напиши /request чтобы создать запрос.")
 
-
-async def ttl_watcher(app: Application):
+# =========================
+# TTL WATCHER
+# =========================
+async def ttl_watcher(application: Application) -> None:
     while True:
         now = time.time()
-        for req in list(REQUESTS.values()):
-            if req.status != "active":
+        for r in list(REQUESTS.values()):
+            if r.status != "active":
                 continue
-            if now - req.created_at >= REQUEST_TTL_SECONDS:
-                try:
-                    await app.bot.send_message(
-                        chat_id=req.author_id,
-                        text=f"⏳ Запрос #{req.rid} живёт уже 48 часов.\nАктуально?\n"
-                             f"Напиши: ДА (продлить) или НЕТ (закрыть)."
-                    )
-                except Exception:
-                    pass
-                req.created_at = now + 3600  # чтобы не спамить
-        await asyncio.sleep(600)
+
+            age = now - r.created_at
+            if age < REQUEST_TTL_SECONDS:
+                continue
+
+            # чтобы не спамить часто
+            if now - (r.last_ttl_prompt_at or 0) < 12 * 3600:
+                continue
+
+            try:
+                await application.bot.send_message(
+                    chat_id=r.author_id,
+                    text=(
+                        f"⏰ Запрос #{r.rid} живёт уже 48 часов.\n"
+                        f"Актуально? (нажми кнопку ниже)"
+                    ),
+                    reply_markup=_ttl_keyboard(r.rid),
+                )
+                r.last_ttl_prompt_at = now
+            except Exception:
+                # пользователь мог не иметь диалога с ботом
+                pass
+
+        await asyncio.sleep(WATCH_INTERVAL_SECONDS)
 
 
-async def handle_yes_no(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message:
-        return
-    u = update.effective_user
-    if not u:
-        return
-    text = (update.message.text or "").strip().lower()
-    if text not in {"да", "нет"}:
-        return
-    candidates = [r for r in REQUESTS.values() if r.author_id == u.id and r.status == "active"]
-    if not candidates:
-        return
-    req = sorted(candidates, key=lambda r: r.created_at)[-1]
-    if text == "да":
-        req.created_at = time.time()
-        await update.message.reply_text(f"Ок ✅ Продлил запрос #{req.rid} ещё на 48 часов.")
-    else:
-        await close_request(req, context)
+async def post_init(application: Application) -> None:
+    # ВАЖНО: используем application.create_task (а не asyncio.create_task)
+    application.create_task(ttl_watcher(application))
 
 
-def main():
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN is required")
-    if GROUP_CHAT_ID == 0:
-        raise RuntimeError("GROUP_CHAT_ID is required")
-    if not BOT_USERNAME:
-        raise RuntimeError("BOT_USERNAME is required")
+# =========================
+# MAIN
+# =========================
+def main() -> None:
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    conv = ConversationHandler(
+        entry_points=[CommandHandler("request", request_entry)],
+        states={
+            AREA: [MessageHandler(filters.TEXT & ~filters.COMMAND, request_area)],
+            BUDGET: [MessageHandler(filters.TEXT & ~filters.COMMAND, request_budget)],
+            ROOMS: [MessageHandler(filters.TEXT & ~filters.COMMAND, request_rooms)],
+            URGENCY: [MessageHandler(filters.TEXT & ~filters.COMMAND, request_urgency)],
+            PETS: [MessageHandler(filters.TEXT & ~filters.COMMAND, request_pets)],
+            CONFIRM: [CallbackQueryHandler(request_confirm_callback, pattern=f"^({CB_CONFIRM}|{CB_CANCEL})$")],
+        },
+        fallbacks=[CommandHandler("cancel", request_cancel)],
+        allow_reentry=True,
+    )
 
-    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("request", request_cmd))
+    app.add_handler(CommandHandler("ping", ping_cmd))
     app.add_handler(CommandHandler("my", my_cmd))
-    app.add_handler(CallbackQueryHandler(on_callback))
-    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & filters.Regex(r"^(да|нет)$"), handle_yes_no))
-    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.TEXT, handle_private_text))
+    app.add_handler(CommandHandler("close", close_cmd))
+    app.add_handler(conv)
 
-    app.post_init = lambda application: asyncio.create_task(ttl_watcher(application))
+    # Кнопки TAKE/CLOSE/TTLYES/TTLNO
+    app.add_handler(CallbackQueryHandler(callbacks_handler))
+
+    # Сообщения агентов в группе
+    app.add_handler(MessageHandler(filters.Chat(GROUP_CHAT_ID) & filters.ALL, group_message_handler))
+
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
