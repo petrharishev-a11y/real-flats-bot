@@ -1,13 +1,16 @@
 import os
-import re
 import time
-import html
-import json
-from dataclasses import dataclass, asdict
-from typing import Dict, Optional, Any, Tuple, List
+import re
+from dataclasses import dataclass, field
+from typing import Dict, Optional, Tuple
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.constants import ParseMode
+from telegram import (
+    Update,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -22,650 +25,672 @@ from telegram.ext import (
 # ENV
 # =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-BOT_USERNAME = os.getenv("BOT_USERNAME", "").strip().lstrip("@")  # without @
-GROUP_CHAT_ID_RAW = os.getenv("GROUP_CHAT_ID", "").strip()  # channel id like -100...
+BOT_USERNAME = os.getenv("BOT_USERNAME", "").strip().lstrip("@")
+GROUP_CHAT_ID_RAW = os.getenv("GROUP_CHAT_ID", "").strip()  # сюда ставим ID КАНАЛА (например -100...)
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is required")
+if not BOT_USERNAME:
+    raise RuntimeError("BOT_USERNAME is required")
+if not GROUP_CHAT_ID_RAW:
+    raise RuntimeError("GROUP_CHAT_ID is required (channel chat id)")
+GROUP_CHAT_ID = int(GROUP_CHAT_ID_RAW)
 
-STATE_FILE = "state.json"
-
-CHAT_TTL_SECONDS = 3600  # 1 hour inactivity auto-close
-
-def _require_env():
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN is required")
-    if not BOT_USERNAME:
-        raise RuntimeError("BOT_USERNAME is required (without @)")
-    if not GROUP_CHAT_ID_RAW:
-        raise RuntimeError("GROUP_CHAT_ID is required (channel id like -100...)")
-    int(GROUP_CHAT_ID_RAW)
-
-GROUP_CHAT_ID = int(GROUP_CHAT_ID_RAW) if GROUP_CHAT_ID_RAW else 0
+BOT_LINK = f"https://t.me/{BOT_USERNAME}"
 
 # =========================
-# STATE (simple persistence for requests)
+# CONFIG
 # =========================
-def load_state() -> Dict[str, Any]:
-    if not os.path.exists(STATE_FILE):
-        return {"counter": 0, "requests": {}}
-    try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        data.setdefault("counter", 0)
-        data.setdefault("requests", {})
-        return data
-    except Exception:
-        return {"counter": 0, "requests": {}}
+REMIND_EVERY_SECONDS = 2 * 24 * 60 * 60  # 2 дня
+SESSION_TTL_SECONDS = 60 * 60            # 1 час "живой чат"
 
-def save_state(state: Dict[str, Any]) -> None:
-    try:
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
+PRICE_LIMITS = [500, 800, 1000, 1300, 1500, 1800, 2000, 2500]  # #до500 ... #до2500, иначе #от2500
 
-def next_rid(state: Dict[str, Any]) -> str:
-    state["counter"] = int(state.get("counter", 0)) + 1
-    save_state(state)
-    return f"R{state['counter']:03d}"
+ROOM_TAGS = {"1": "#1к", "2": "#2к", "3": "#3к", "4": "#4к", "5": "#5к", "6": "#6к"}
+
+DISTRICTS = [
+    ("Ваке", "#ваке"),
+    ("Вера", "#вера"),
+    ("Сололаки", "#сололаки"),
+    ("Старый город", "#старыйгород"),
+    ("Сабуртало", "#сабуртало"),
+    ("Чугурети", "#чугурети"),
+    ("Дидубе", "#дидубе"),
+    ("Церетели", "#церетели"),
+    ("Ортачала", "#ортачала"),
+    ("Дигоми массив", "#дигомимассив"),
+    ("Диди Дигоми", "#дидидигоми"),
+    ("Глдани", "#глдани"),
+    ("Варкетили", "#варкетили"),
+]
+DISTRICT_BY_TEXT = {name.lower(): tag for name, tag in DISTRICTS}
+
+YES_NO_KB = ReplyKeyboardMarkup([["ДА", "НЕТ"]], resize_keyboard=True, one_time_keyboard=True)
 
 # =========================
-# DATA
+# STORAGE (пока в памяти)
 # =========================
+REQ_COUNTER = 0  # R001, R002...
+REQUESTS: Dict[str, "Request"] = {}
+
+# активные "диалоги" в личке (чтобы можно было писать без кнопки каждый раз)
+# user_id -> (peer_id, req_id, expires_at)
+ACTIVE_CHAT: Dict[int, Tuple[int, str, float]] = {}
+
+
 @dataclass
 class Request:
-    rid: str
+    req_id: str
     author_id: int
-    status: str
     created_at: float
-    districts: str
-    budget: str
-    rooms: str
-    term: str
-    pets: str
-    amenities: str
-    area: str
-    comment: str
+    last_remind_at: float = 0.0
+    awaiting_remind_answer: bool = False
+
+    district_name: str = ""
+    district_tag: str = ""
+    rooms: str = ""
+    rooms_tag: str = ""
+    budget: int = 0
+    price_tag: str = ""
+    bedrooms: Optional[str] = None
+
+    dishwasher: Optional[bool] = None
+    bath: Optional[bool] = None
+    oven: Optional[bool] = None
+    area_m2: Optional[int] = None
+    comment: str = ""
+
     channel_message_id: Optional[int] = None
+    is_active: bool = True
 
-def get_req(state: Dict[str, Any], rid: str) -> Optional[Request]:
-    rid = rid.strip().upper()
-    raw = state["requests"].get(rid)
-    if not raw:
-        return None
-    try:
-        return Request(**raw)
-    except Exception:
-        return None
-
-def put_req(state: Dict[str, Any], req: Request) -> None:
-    state["requests"][req.rid] = asdict(req)
-    save_state(state)
-
-def list_my_active(state: Dict[str, Any], user_id: int) -> List[str]:
-    out = []
-    for rid, raw in state["requests"].items():
-        if raw.get("author_id") == user_id and raw.get("status") == "active":
-            out.append(rid)
-    out.sort()
-    return out
 
 # =========================
 # HELPERS
 # =========================
-def h(s: str) -> str:
-    return html.escape(s or "")
+def next_req_id() -> str:
+    global REQ_COUNTER
+    REQ_COUNTER += 1
+    return f"R{REQ_COUNTER:03d}"
 
-def deep_link_offer(rid: str) -> str:
-    return f"https://t.me/{BOT_USERNAME}?start=offer_{rid}"
 
-def agent_label(u) -> str:
-    if not u:
-        return "agent"
-    if getattr(u, "username", None):
-        return f"@{u.username}"
-    return f"{u.first_name or 'Agent'} (id:{u.id})"
+def pick_price_tag(price: int) -> str:
+    for lim in PRICE_LIMITS:
+        if price <= lim:
+            return f"#до{lim}"
+    return "#от2500"
 
-def is_no(text: str) -> bool:
+
+def normalize_yes_no(text: str) -> Optional[bool]:
     t = (text or "").strip().lower()
-    return t in {"нет", "no", "-", "0", "none", "не важно", "неважно"}
-
-def channel_text(req: Request) -> str:
-    lines = [
-        f"📌 <b>Запрос {h(req.rid)}</b>",
-        "",
-        f"🏙 <b>Районы:</b> {h(req.districts)}",
-        f"💰 <b>Бюджет:</b> {h(req.budget)}",
-        f"🏠 <b>Комнаты:</b> {h(req.rooms)}",
-        f"🕐 <b>Срок аренды:</b> {h(req.term)}",
-        f"🐾 <b>Животные:</b> {h(req.pets)}",
-        f"📐 <b>Площадь:</b> {h(req.area)}",
-        f"✅ <b>Удобства:</b> {h(req.amenities)}",
-    ]
-    if req.comment and not is_no(req.comment):
-        lines.append(f"💬 <b>Комментарий:</b> {h(req.comment)}")
-    lines += ["", "👇 Нажми кнопку и отправь варианты боту (их увидит только клиент)."]
-    return "\n".join(lines)
-
-def author_created_text(req: Request) -> str:
-    lines = [
-        f"✅ Запрос <b>{h(req.rid)}</b> создан и опубликован в канале.",
-        "Когда агент пришлёт вариант — появится кнопка «Открыть чат».",
-    ]
-    return "\n".join(lines)
-
-# =========================
-# CHAT SESSIONS (in-memory)
-# =========================
-# session_key = "R001|client_id|agent_id"
-SESSIONS: Dict[str, Dict[str, Any]] = {}   # key -> {rid, client_id, agent_id, expires_at}
-CURRENT: Dict[int, str] = {}              # user_id -> session_key
-PENDING: Dict[int, Tuple[int, int]] = {}  # user_id -> (from_chat_id, message_id) unsent msg
-
-def make_key(rid: str, client_id: int, agent_id: int) -> str:
-    return f"{rid}|{client_id}|{agent_id}"
-
-def parse_key(key: str) -> Tuple[str, int, int]:
-    rid, c, a = key.split("|", 2)
-    return rid, int(c), int(a)
-
-def touch_session(rid: str, client_id: int, agent_id: int) -> str:
-    key = make_key(rid, client_id, agent_id)
-    SESSIONS[key] = {
-        "rid": rid,
-        "client_id": client_id,
-        "agent_id": agent_id,
-        "expires_at": time.time() + CHAT_TTL_SECONDS,
-    }
-    return key
-
-def is_active_session(key: str) -> bool:
-    s = SESSIONS.get(key)
-    if not s:
+    if t in ("да", "yes", "y", "+"):
+        return True
+    if t in ("нет", "no", "n", "-"):
         return False
-    return s["expires_at"] > time.time()
+    return None
 
-def user_sessions(user_id: int) -> List[str]:
-    now = time.time()
-    keys = []
-    for k, s in list(SESSIONS.items()):
-        if s["expires_at"] <= now:
-            continue
-        if s["client_id"] == user_id or s["agent_id"] == user_id:
-            keys.append(k)
-    # newest first
-    keys.sort(key=lambda k: SESSIONS[k]["expires_at"], reverse=True)
-    return keys
 
-def counterpart_id(key: str, user_id: int) -> int:
-    rid, c, a = parse_key(key)
-    return a if user_id == c else c
+def build_tags_line(req: Request) -> str:
+    return f"{req.price_tag} {req.rooms_tag} {req.district_tag}"
 
-def role_prefix(key: str, sender_id: int, sender_label: str) -> str:
-    rid, c, a = parse_key(key)
-    if sender_id == c:
-        return f"💬 <b>Клиент</b> по <b>{h(rid)}</b>:"
-    return f"💬 <b>Агент {h(sender_label)}</b> по <b>{h(rid)}</b>:"
 
-def session_buttons(key: str) -> InlineKeyboardMarkup:
-    rid, c, a = parse_key(key)
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Сделать активным", callback_data=f"sw|{rid}|{c}|{a}"),
-        InlineKeyboardButton("🔚 Закрыть чат", callback_data=f"end|{rid}|{c}|{a}"),
-    ]])
+def req_public_text(req: Request) -> str:
+    # Пост в канале — без автора (анонимно)
+    lines = [
+        f"🟢 Запрос #{req.req_id}",
+        "",
+        f"📍 Район: {req.district_name}",
+        f"🚪 Комнаты: {req.rooms}",
+        f"💵 Бюджет: ${req.budget}",
+    ]
+    if req.bedrooms:
+        lines.append(f"🛏 Спальни: {req.bedrooms}")
 
-async def prompt_choose_chat(update: Update, context: ContextTypes.DEFAULT_TYPE, pending: bool = True) -> None:
-    uid = update.effective_user.id
-    keys = user_sessions(uid)
-    if not keys:
-        await update.effective_message.reply_text(
-            "Сейчас нет активного чата.\n"
-            "Если ты агент — зайди по кнопке в канале «Отправить варианты».\n"
-            "Если ты клиент — открой чат через кнопку под вариантом."
-        )
-        return
+    # Удобства
+    def yn(v: Optional[bool]) -> str:
+        return "ДА" if v is True else "НЕТ" if v is False else "—"
 
-    # store pending message to send after selection
-    if pending and update.message:
-        PENDING[uid] = (update.effective_chat.id, update.message.message_id)
+    lines += [
+        "",
+        f"🧰 Удобства:",
+        f"• Посудомойка: {yn(req.dishwasher)}",
+        f"• Ванна: {yn(req.bath)}",
+        f"• Духовка: {yn(req.oven)}",
+    ]
 
-    rows = []
-    for k in keys[:8]:
-        rid, c, a = parse_key(k)
-        other = a if uid == c else c
-        title = f"{rid} • чат с {other}"
-        rows.append([InlineKeyboardButton(title, callback_data=f"sw|{rid}|{c}|{a}")])
+    if req.area_m2 is not None:
+        lines.append(f"📐 Площадь: {req.area_m2} м²")
 
-    await update.effective_message.reply_text(
-        "⚠️ Сообщение не отправлено — не выбран чат.\nВыбери куда отправить:",
-        reply_markup=InlineKeyboardMarkup(rows),
-    )
+    if req.comment and req.comment.strip().lower() != "нет":
+        lines += ["", f"💬 Комментарий: {req.comment.strip()}"]
 
-async def forward_any_message(context: ContextTypes.DEFAULT_TYPE, to_chat_id: int, from_chat_id: int, message_id: int) -> None:
-    await context.bot.copy_message(chat_id=to_chat_id, from_chat_id=from_chat_id, message_id=message_id)
+    lines += [
+        "",
+        "—",
+        build_tags_line(req),
+    ]
+    return "\n".join(lines)
 
-# =========================
-# REQUEST CONVERSATION
-# =========================
-REQ_DISTRICTS, REQ_BUDGET, REQ_ROOMS, REQ_TERM, REQ_PETS, REQ_AREA, REQ_AMEN, REQ_COMMENT, REQ_CONFIRM = range(9)
 
-async def request_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if update.effective_chat.type != "private":
-        await update.effective_message.reply_text("Создание запроса — только в личке с ботом.")
-        return ConversationHandler.END
-    context.user_data["new_req"] = {}
-    await update.effective_message.reply_text("1) Какие районы? (можно несколько)")
-    return REQ_DISTRICTS
+async def delete_request_everywhere(req: Request, context: ContextTypes.DEFAULT_TYPE, reason: str = ""):
+    req.is_active = False
 
-async def request_districts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["new_req"]["districts"] = (update.message.text or "").strip()
-    await update.message.reply_text("2) Бюджет? (например: $800–1200)")
-    return REQ_BUDGET
+    # удаляем пост в канале
+    if req.channel_message_id is not None:
+        try:
+            await context.bot.delete_message(chat_id=GROUP_CHAT_ID, message_id=req.channel_message_id)
+        except Exception:
+            pass
 
-async def request_budget(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["new_req"]["budget"] = (update.message.text or "").strip()
-    await update.message.reply_text("3) Комнаты/спальни? (например: 2к / студия)")
-    return REQ_ROOMS
+    # уведомим автора
+    try:
+        msg = f"🧹 Запрос #{req.req_id} удалён."
+        if reason:
+            msg += f"\nПричина: {reason}"
+        await context.bot.send_message(chat_id=req.author_id, text=msg)
+    except Exception:
+        pass
 
-async def request_rooms(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["new_req"]["rooms"] = (update.message.text or "").strip()
-    await update.message.reply_text("4) Срок аренды? (например: 6 месяцев+ / 12 месяцев+)")
-    return REQ_TERM
+    # чистим память
+    REQUESTS.pop(req.req_id, None)
 
-async def request_term(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["new_req"]["term"] = (update.message.text or "").strip()
-    await update.message.reply_text("5) Животные? (да / нет / по согласованию)")
-    return REQ_PETS
 
-async def request_pets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["new_req"]["pets"] = (update.message.text or "").strip()
-    await update.message.reply_text("6) Желаемая площадь (м²)? Если не важно — «нет».")
-    return REQ_AREA
+def set_active_chat(user_id: int, peer_id: int, req_id: str):
+    ACTIVE_CHAT[user_id] = (peer_id, req_id, time.time() + SESSION_TTL_SECONDS)
 
-async def request_area(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    t = (update.message.text or "").strip()
-    context.user_data["new_req"]["area"] = t if t else "нет"
-    await update.message.reply_text("7) Удобства (если обязательно): посудомойка / ванна / духовка… или «нет».")
-    return REQ_AMEN
 
-async def request_amen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    t = (update.message.text or "").strip()
-    context.user_data["new_req"]["amenities"] = t if t else "нет"
-    await update.message.reply_text("8) Комментарий (если есть). Если нет — «нет».")
-    return REQ_COMMENT
+def get_active_chat(user_id: int) -> Optional[Tuple[int, str]]:
+    data = ACTIVE_CHAT.get(user_id)
+    if not data:
+        return None
+    peer_id, req_id, exp = data
+    if time.time() > exp:
+        ACTIVE_CHAT.pop(user_id, None)
+        return None
+    return peer_id, req_id
 
-async def request_comment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    t = (update.message.text or "").strip()
-    context.user_data["new_req"]["comment"] = t if t else "нет"
-
-    d = context.user_data["new_req"]
-    preview = (
-        "<b>Проверь:</b>\n\n"
-        f"🏙 Районы: {h(d['districts'])}\n"
-        f"💰 Бюджет: {h(d['budget'])}\n"
-        f"🏠 Комнаты: {h(d['rooms'])}\n"
-        f"🕐 Срок: {h(d['term'])}\n"
-        f"🐾 Животные: {h(d['pets'])}\n"
-        f"📐 Площадь: {h(d['area'])}\n"
-        f"✅ Удобства: {h(d['amenities'])}\n"
-        f"💬 Комментарий: {h(d['comment'])}\n"
-    )
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Опубликовать", callback_data="req_publish")],
-        [InlineKeyboardButton("❌ Отмена", callback_data="req_cancel")],
-    ])
-    await update.message.reply_text(preview, parse_mode=ParseMode.HTML, reply_markup=kb)
-    return REQ_CONFIRM
-
-async def request_confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    q = update.callback_query
-    await q.answer()
-
-    if q.data == "req_cancel":
-        context.user_data.pop("new_req", None)
-        await q.edit_message_text("Ок, отменил.")
-        return ConversationHandler.END
-
-    if q.data != "req_publish":
-        return REQ_CONFIRM
-
-    state = context.application.bot_data["state"]
-    rid = next_rid(state)
-
-    d = context.user_data.get("new_req", {})
-    req = Request(
-        rid=rid,
-        author_id=update.effective_user.id,
-        status="active",
-        created_at=time.time(),
-        districts=d.get("districts", "-"),
-        budget=d.get("budget", "-"),
-        rooms=d.get("rooms", "-"),
-        term=d.get("term", "-"),
-        pets=d.get("pets", "-"),
-        amenities=d.get("amenities", "нет"),
-        area=d.get("area", "нет"),
-        comment=d.get("comment", "нет"),
-    )
-
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("📩 Отправить варианты", url=deep_link_offer(rid))
-    ]])
-
-    msg = await context.bot.send_message(
-        chat_id=GROUP_CHAT_ID,
-        text=channel_text(req),
-        parse_mode=ParseMode.HTML,
-        disable_web_page_preview=True,
-        disable_notification=True,
-        reply_markup=kb,
-    )
-    req.channel_message_id = msg.message_id
-
-    put_req(state, req)
-    context.user_data.pop("new_req", None)
-
-    await q.edit_message_text("Опубликовал ✅")
-    await context.bot.send_message(
-        chat_id=req.author_id,
-        text=author_created_text(req),
-        parse_mode=ParseMode.HTML,
-        disable_web_page_preview=True,
-    )
-    return ConversationHandler.END
 
 # =========================
-# COMMANDS
+# /start deep links
 # =========================
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args or []
     if args:
         payload = args[0].strip()
-        if payload.startswith("offer_"):
-            rid = payload.replace("offer_", "", 1).strip().upper()
-            await start_offer_mode(update, context, rid)
+        if payload.startswith("reply_"):
+            req_id = payload.replace("reply_", "", 1).strip()
+            req = REQUESTS.get(req_id)
+            if not req or not req.is_active:
+                await update.message.reply_text("Запрос не найден или уже закрыт.")
+                return
+            # агентский режим: писать варианты
+            context.user_data["mode"] = "agent_reply"
+            context.user_data["req_id"] = req_id
+            await update.message.reply_text(
+                f"Отправляй варианты по запросу #{req_id} (ссылки/текст). "
+                f"Когда закончишь — напиши: ГОТОВО",
+                reply_markup=ReplyKeyboardRemove(),
+            )
             return
 
-    await update.effective_message.reply_text(
-        "Real Flats Bot\n\n"
+        if payload.startswith("view_"):
+            req_id = payload.replace("view_", "", 1).strip()
+            req = REQUESTS.get(req_id)
+            if not req:
+                await update.message.reply_text("Запрос не найден.")
+                return
+            await update.message.reply_text(req_public_text(req))
+            return
+
+    await update.message.reply_text(
+        "Привет! Команды:\n"
         "/request — создать запрос\n"
-        "/my — мои запросы\n"
-        "/chats — мои чаты\n"
-        "/end — закрыть текущий чат\n"
-        "/done — выйти из режима агента (/offer)\n"
+        "/my — мои активные запросы\n"
+        "/help — помощь"
     )
 
-async def cmd_my(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.effective_chat.type != "private":
-        await update.effective_message.reply_text("Команда /my — в личке с ботом.")
-        return
-    state = context.application.bot_data["state"]
-    mine = list_my_active(state, update.effective_user.id)
-    if not mine:
-        await update.effective_message.reply_text("У тебя нет активных запросов.")
-        return
-    await update.effective_message.reply_text("Твои активные:\n" + "\n".join([f"• {r}" for r in mine]))
 
-async def cmd_offer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.effective_chat.type != "private":
-        await update.effective_message.reply_text("Отправка вариантов — только в личке с ботом.")
-        return
-    if not context.args:
-        await update.effective_message.reply_text("Напиши: /offer R001")
-        return
-    rid = context.args[0].strip().upper()
-    await start_offer_mode(update, context, rid)
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Команды:\n"
+        "/request — создать запрос\n"
+        "/my — мои активные запросы\n\n"
+        "Агентам: отвечайте на запросы через кнопку в канале «Отправить варианты»."
+    )
 
-async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # exits offer mode (agent)
-    context.user_data.pop("offer_rid", None)
-    await update.effective_message.reply_text("Ок ✅")
 
-async def cmd_chats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    uid = update.effective_user.id
-    keys = user_sessions(uid)
-    if not keys:
-        await update.effective_message.reply_text("Нет активных чатов.")
-        return
+# =========================
+# REQUEST FLOW
+# =========================
+(
+    ST_DISTRICT,
+    ST_ROOMS,
+    ST_BUDGET,
+    ST_BEDROOMS,
+    ST_DISHWASHER,
+    ST_BATH,
+    ST_OVEN,
+    ST_AREA,
+    ST_COMMENT,
+) = range(9)
 
+
+def district_keyboard():
     rows = []
-    for k in keys[:10]:
-        rid, c, a = parse_key(k)
-        other = a if uid == c else c
-        rows.append([InlineKeyboardButton(f"{rid} • чат с {other}", callback_data=f"sw|{rid}|{c}|{a}")])
+    row = []
+    for i, (name, _tag) in enumerate(DISTRICTS, start=1):
+        row.append(name)
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True, one_time_keyboard=True)
 
-    cur = CURRENT.get(uid)
-    cur_txt = f"Текущий чат: {cur}" if cur else "Текущий чат: не выбран"
-    await update.effective_message.reply_text(cur_txt + "\nВыбери чат:", reply_markup=InlineKeyboardMarkup(rows))
 
-async def cmd_end(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+def rooms_keyboard():
+    return ReplyKeyboardMarkup([["1", "2", "3"], ["4", "5", "6"]], resize_keyboard=True, one_time_keyboard=True)
+
+
+async def request_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != "private":
+        await update.message.reply_text("Создавать запрос нужно в личке с ботом.")
+        return ConversationHandler.END
+
+    context.user_data["req_draft"] = {}
+    await update.message.reply_text("📍 Выбери район (ОДИН):", reply_markup=district_keyboard())
+    return ST_DISTRICT
+
+
+async def st_district(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    tag = DISTRICT_BY_TEXT.get(text.lower())
+    if not tag:
+        await update.message.reply_text("Выбери район кнопкой ниже:", reply_markup=district_keyboard())
+        return ST_DISTRICT
+
+    context.user_data["req_draft"]["district_name"] = text
+    context.user_data["req_draft"]["district_tag"] = tag
+    await update.message.reply_text("🚪 Сколько комнат? (1–6)", reply_markup=rooms_keyboard())
+    return ST_ROOMS
+
+
+async def st_rooms(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    if text not in ROOM_TAGS:
+        await update.message.reply_text("Выбери 1–6 кнопкой:", reply_markup=rooms_keyboard())
+        return ST_ROOMS
+    context.user_data["req_draft"]["rooms"] = text
+    context.user_data["req_draft"]["rooms_tag"] = ROOM_TAGS[text]
+    await update.message.reply_text("💵 Бюджет в $ (только число, например 1200):", reply_markup=ReplyKeyboardRemove())
+    return ST_BUDGET
+
+
+async def st_budget(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    m = re.search(r"\d+", text)
+    if not m:
+        await update.message.reply_text("Напиши число, например: 1200")
+        return ST_BUDGET
+    budget = int(m.group(0))
+    context.user_data["req_draft"]["budget"] = budget
+    context.user_data["req_draft"]["price_tag"] = pick_price_tag(budget)
+
+    await update.message.reply_text("🛏 Сколько спален? (или напиши НЕТ)")
+    return ST_BEDROOMS
+
+
+async def st_bedrooms(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    if text.lower() == "нет":
+        context.user_data["req_draft"]["bedrooms"] = None
+    else:
+        if not re.fullmatch(r"\d+", text):
+            await update.message.reply_text("Напиши число (например 1/2) или НЕТ")
+            return ST_BEDROOMS
+        context.user_data["req_draft"]["bedrooms"] = text
+
+    await update.message.reply_text("🧰 Посудомойка обязательна? (ДА/НЕТ)", reply_markup=YES_NO_KB)
+    return ST_DISHWASHER
+
+
+async def st_dishwasher(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    v = normalize_yes_no(update.message.text)
+    if v is None:
+        await update.message.reply_text("Ответь ДА или НЕТ", reply_markup=YES_NO_KB)
+        return ST_DISHWASHER
+    context.user_data["req_draft"]["dishwasher"] = v
+
+    await update.message.reply_text("🛁 Ванна обязательна? (ДА/НЕТ)", reply_markup=YES_NO_KB)
+    return ST_BATH
+
+
+async def st_bath(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    v = normalize_yes_no(update.message.text)
+    if v is None:
+        await update.message.reply_text("Ответь ДА или НЕТ", reply_markup=YES_NO_KB)
+        return ST_BATH
+    context.user_data["req_draft"]["bath"] = v
+
+    await update.message.reply_text("🍽 Духовка обязательна? (ДА/НЕТ)", reply_markup=YES_NO_KB)
+    return ST_OVEN
+
+
+async def st_oven(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    v = normalize_yes_no(update.message.text)
+    if v is None:
+        await update.message.reply_text("Ответь ДА или НЕТ", reply_markup=YES_NO_KB)
+        return ST_OVEN
+    context.user_data["req_draft"]["oven"] = v
+
+    await update.message.reply_text("📐 Желаемая площадь (м²) или НЕТ:", reply_markup=ReplyKeyboardRemove())
+    return ST_AREA
+
+
+async def st_area(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    if text.lower() == "нет":
+        context.user_data["req_draft"]["area_m2"] = None
+    else:
+        m = re.search(r"\d+", text)
+        if not m:
+            await update.message.reply_text("Напиши число (например 65) или НЕТ")
+            return ST_AREA
+        context.user_data["req_draft"]["area_m2"] = int(m.group(0))
+
+    await update.message.reply_text("💬 Комментарий (или НЕТ):")
+    return ST_COMMENT
+
+
+async def st_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    context.user_data["req_draft"]["comment"] = text
+
+    # Создаём запрос
+    req_id = next_req_id()
+    d = context.user_data.get("req_draft", {})
+
+    req = Request(
+        req_id=req_id,
+        author_id=update.effective_user.id,
+        created_at=time.time(),
+        district_name=d["district_name"],
+        district_tag=d["district_tag"],
+        rooms=d["rooms"],
+        rooms_tag=d["rooms_tag"],
+        budget=d["budget"],
+        price_tag=d["price_tag"],
+        bedrooms=d.get("bedrooms"),
+        dishwasher=d.get("dishwasher"),
+        bath=d.get("bath"),
+        oven=d.get("oven"),
+        area_m2=d.get("area_m2"),
+        comment=d.get("comment", ""),
+    )
+    REQUESTS[req_id] = req
+
+    # Постим в канал + кнопка агентам
+    kb = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("📩 Отправить варианты", url=f"{BOT_LINK}?start=reply_{req_id}")],
+            [InlineKeyboardButton("🔎 Открыть в боте", url=f"{BOT_LINK}?start=view_{req_id}")],
+        ]
+    )
+    msg = await context.bot.send_message(
+        chat_id=GROUP_CHAT_ID,
+        text=req_public_text(req),
+        reply_markup=kb,
+        disable_web_page_preview=True,
+    )
+    req.channel_message_id = msg.message_id
+
+    await update.message.reply_text(
+        f"✅ Запрос #{req_id} создан и опубликован в канале.\n"
+        "Ответы агентов будут приходить сюда в личку.\n\n"
+        "Команда: /my — посмотреть активные запросы",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    return ConversationHandler.END
+
+
+async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("req_draft", None)
+    await update.message.reply_text("Ок, отменено.", reply_markup=ReplyKeyboardRemove())
+    return ConversationHandler.END
+
+
+async def my_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    key = CURRENT.get(uid)
-    if not key or not is_active_session(key):
-        await update.effective_message.reply_text("Нет активного чата.")
-        CURRENT.pop(uid, None)
+    active = [r for r in REQUESTS.values() if r.author_id == uid and r.is_active]
+    if not active:
+        await update.message.reply_text("У тебя нет активных запросов.")
         return
-    rid, c, a = parse_key(key)
-    await close_session(context, rid, c, a, reason="закрыт вручную")
+    lines = ["Твои активные запросы:"]
+    for r in sorted(active, key=lambda x: x.created_at, reverse=True):
+        lines.append(f"• #{r.req_id} — {r.district_name}, {r.rooms}к, ${r.budget}")
+    await update.message.reply_text("\n".join(lines))
+
 
 # =========================
-# CALLBACKS (switch/open/end)
+# CHAT / REPLIES
 # =========================
-async def cb_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+
+    text = (update.message.text or "").strip()
+    uid = update.effective_user.id
+
+    # 1) если это агентский режим (ответ по запросу)
+    mode = context.user_data.get("mode")
+    if mode == "agent_reply":
+        req_id = context.user_data.get("req_id")
+        if text.lower() == "готово":
+            context.user_data.pop("mode", None)
+            context.user_data.pop("req_id", None)
+            await update.message.reply_text("✅ Ок, закончили. Если нужно — отвечай на другой запрос из канала.")
+            return
+
+        req = REQUESTS.get(req_id)
+        if not req or not req.is_active:
+            await update.message.reply_text("Запрос уже закрыт или удалён.")
+            context.user_data.pop("mode", None)
+            context.user_data.pop("req_id", None)
+            return
+
+        agent = update.effective_user
+        agent_name = agent.username and f"@{agent.username}" or agent.first_name or "Агент"
+
+        # отправляем автору запроса
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✉️ Ответить агенту", callback_data=f"chat|{req_id}|{uid}")],
+            [InlineKeyboardButton("🧹 Закрыть запрос", callback_data=f"close|{req_id}")],
+        ])
+        await context.bot.send_message(
+            chat_id=req.author_id,
+            text=f"📩 Вариант по запросу #{req_id} от {agent_name}:\n\n{text}",
+            reply_markup=kb,
+            disable_web_page_preview=True,
+        )
+
+        # ставим сессию “чат” для автора и агента на 1 час
+        set_active_chat(req.author_id, uid, req_id)
+        set_active_chat(uid, req.author_id, req_id)
+
+        await update.message.reply_text("✅ Отправлено автору запроса.")
+        return
+
+    # 2) если есть активная сессия чата — пересылаем “как есть”
+    active = get_active_chat(uid)
+    if active:
+        peer_id, req_id = active
+        await context.bot.send_message(
+            chat_id=peer_id,
+            text=f"💬 Сообщение по #{req_id}:\n{text}",
+            disable_web_page_preview=True,
+        )
+        # продлеваем сессию
+        set_active_chat(uid, peer_id, req_id)
+        return
+
+    # 3) иначе подсказка
+    await update.message.reply_text(
+        "Я не понял, куда это отправить.\n\n"
+        "Если ты агент — зайди в канал и нажми «📩 Отправить варианты» под нужным запросом.\n"
+        "Если ты клиент/автор — нажми «✉️ Ответить агенту» под сообщением агента (или напиши /my)."
+    )
+
+
+# =========================
+# CALLBACKS
+# =========================
+async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if not q:
         return
     await q.answer()
 
     data = q.data or ""
-    # sw|R001|client|agent
-    if data.startswith("sw|"):
-        _, rid, c, a = data.split("|", 3)
-        key = touch_session(rid, int(c), int(a))
-        CURRENT[q.from_user.id] = key
-
-        # If user had pending message -> send it now
-        if q.from_user.id in PENDING:
-            from_chat_id, mid = PENDING.pop(q.from_user.id)
-            to_id = counterpart_id(key, q.from_user.id)
-            sender_lbl = agent_label(q.from_user)
-            await context.bot.send_message(
-                chat_id=to_id,
-                text=role_prefix(key, q.from_user.id, sender_lbl),
-                parse_mode=ParseMode.HTML,
-                reply_markup=session_buttons(key),
-            )
-            await forward_any_message(context, to_id, from_chat_id, mid)
-
-        await q.message.reply_text("✅ Чат выбран. Просто пиши сюда.")
+    parts = data.split("|")
+    if not parts:
         return
 
-    # open|R001|client|agent
-    if data.startswith("open|"):
-        _, rid, c, a = data.split("|", 3)
-        key = touch_session(rid, int(c), int(a))
-        # set current for who pressed
-        CURRENT[q.from_user.id] = key
-        await q.message.reply_text("✅ Чат открыт. Просто пиши сюда.")
+    if parts[0] == "chat" and len(parts) == 3:
+        req_id = parts[1]
+        peer_id = int(parts[2])
+        # включаем "сессию" на 1 час — теперь можно писать без кнопки
+        set_active_chat(q.from_user.id, peer_id, req_id)
+        await q.edit_message_reply_markup(reply_markup=q.message.reply_markup)
+        await q.message.reply_text(f"✅ Чат активирован по #{req_id} на 1 час. Пиши сюда — я буду пересылать.")
         return
 
-    # end|R001|client|agent
-    if data.startswith("end|"):
-        _, rid, c, a = data.split("|", 3)
-        await close_session(context, rid, int(c), int(a), reason="закрыт")
-        await q.message.reply_text("🔚 Чат закрыт.")
-        return
-
-# =========================
-# MODES
-# =========================
-async def start_offer_mode(update: Update, context: ContextTypes.DEFAULT_TYPE, rid: str) -> None:
-    state = context.application.bot_data["state"]
-    req = get_req(state, rid)
-    if not req or req.status != "active":
-        await update.effective_message.reply_text("Этот запрос не найден или уже закрыт.")
-        return
-    context.user_data["offer_rid"] = rid
-    await update.effective_message.reply_text(
-        f"Ок. Кидай варианты по <b>{h(rid)}</b> сюда.\n"
-        "Можно текст/ссылки/фото/форварды.\n"
-        "Когда закончил — /done",
-        parse_mode=ParseMode.HTML,
-    )
-
-async def close_session(context: ContextTypes.DEFAULT_TYPE, rid: str, client_id: int, agent_id: int, reason: str) -> None:
-    key = make_key(rid, client_id, agent_id)
-    SESSIONS.pop(key, None)
-
-    # clear current if points to that key
-    if CURRENT.get(client_id) == key:
-        CURRENT.pop(client_id, None)
-    if CURRENT.get(agent_id) == key:
-        CURRENT.pop(agent_id, None)
-
-    try:
-        await context.bot.send_message(chat_id=client_id, text=f"🔚 Чат {rid} {reason}.")
-    except Exception:
-        pass
-    try:
-        await context.bot.send_message(chat_id=agent_id, text=f"🔚 Чат {rid} {reason}.")
-    except Exception:
-        pass
-
-# =========================
-# PRIVATE ROUTER (ANY TYPE)
-# =========================
-async def private_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.effective_chat.type != "private" or not update.message:
-        return
-
-    uid = update.effective_user.id
-
-    # 1) If user has CURRENT session -> forward to counterpart
-    cur = CURRENT.get(uid)
-    if cur and is_active_session(cur):
-        # refresh TTL
-        rid, c, a = parse_key(cur)
-        touch_session(rid, c, a)
-        to_id = counterpart_id(cur, uid)
-        sender_lbl = agent_label(update.effective_user)
-
-        # send context header + message
-        await context.bot.send_message(
-            chat_id=to_id,
-            text=role_prefix(cur, uid, sender_lbl),
-            parse_mode=ParseMode.HTML,
-            reply_markup=session_buttons(cur),
-        )
-        await forward_any_message(context, to_id, update.effective_chat.id, update.message.message_id)
-        return
-
-    # 2) If user has exactly 1 active session -> auto-use it
-    keys = user_sessions(uid)
-    if len(keys) == 1:
-        CURRENT[uid] = keys[0]
-        await private_router(update, context)
-        return
-
-    # 3) Agent offer mode
-    offer_rid = context.user_data.get("offer_rid")
-    if offer_rid:
-        state = context.application.bot_data["state"]
-        req = get_req(state, offer_rid)
-        if not req or req.status != "active":
-            await update.effective_message.reply_text("Запрос не найден или закрыт.")
-            context.user_data.pop("offer_rid", None)
+    if parts[0] == "close" and len(parts) == 2:
+        req_id = parts[1]
+        req = REQUESTS.get(req_id)
+        if not req:
+            await q.message.reply_text("Запрос не найден.")
             return
-
-        agent = update.effective_user
-        a_lbl = agent_label(agent)
-
-        # create/touch session but DO NOT set current for client automatically
-        key = touch_session(offer_rid, req.author_id, agent.id)
-
-        # To client: header + OPEN CHAT button
-        kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton("💬 Открыть чат", callback_data=f"open|{offer_rid}|{req.author_id}|{agent.id}"),
-        ]])
-
-        await context.bot.send_message(
-            chat_id=req.author_id,
-            text=f"📩 Вариант по <b>{h(offer_rid)}</b> от <b>{h(a_lbl)}</b>:",
-            parse_mode=ParseMode.HTML,
-            reply_markup=kb,
-        )
-
-        await forward_any_message(context, req.author_id, update.effective_chat.id, update.message.message_id)
-        await update.effective_message.reply_text("Отправил владельцу ✅")
+        if q.from_user.id != req.author_id:
+            await q.message.reply_text("Закрыть запрос может только автор.")
+            return
+        await delete_request_everywhere(req, context, reason="закрыт автором")
         return
 
-    # 4) No current chat + many sessions -> force choose (prevents silent drops)
-    if keys:
-        await prompt_choose_chat(update, context, pending=True)
+    if parts[0] == "keep" and len(parts) == 2:
+        req_id = parts[1]
+        req = REQUESTS.get(req_id)
+        if not req:
+            return
+        if q.from_user.id != req.author_id:
+            return
+        req.last_remind_at = time.time()
+        req.awaiting_remind_answer = False
+        await q.message.reply_text(f"✅ Ок, запрос #{req_id} остаётся активным.")
         return
 
-    # 5) Nothing to do
-    await update.effective_message.reply_text(
-        "Я не понял, куда это отправить.\n"
-        "Если ты агент — зайди по кнопке в канале.\n"
-        "Если ты клиент — нажми «Открыть чат» под вариантом."
-    )
+    if parts[0] == "drop" and len(parts) == 2:
+        req_id = parts[1]
+        req = REQUESTS.get(req_id)
+        if not req:
+            return
+        if q.from_user.id != req.author_id:
+            return
+        await delete_request_everywhere(req, context, reason="автор подтвердил, что поиск не актуален")
+        return
+
 
 # =========================
-# CLEANUP JOB
+# PERIODIC JOBS
 # =========================
-async def cleanup_sessions(context: ContextTypes.DEFAULT_TYPE) -> None:
+async def periodic_maintenance(context: ContextTypes.DEFAULT_TYPE):
     now = time.time()
-    expired = []
-    for k, s in list(SESSIONS.items()):
-        if s["expires_at"] <= now:
-            expired.append(k)
 
-    for k in expired:
-        rid, c, a = parse_key(k)
-        await close_session(context, rid, c, a, reason="закрыт по тайм-ауту (1 час без активности)")
+    # чистим истёкшие чаты
+    to_del = []
+    for uid, (_peer, _req_id, exp) in ACTIVE_CHAT.items():
+        if now > exp:
+            to_del.append(uid)
+    for uid in to_del:
+        ACTIVE_CHAT.pop(uid, None)
 
-def main() -> None:
-    _require_env()
+    # напоминания каждые 2 дня
+    for req in list(REQUESTS.values()):
+        if not req.is_active:
+            continue
+        if req.awaiting_remind_answer:
+            # уже ждём ответ — не спамим
+            continue
+        if req.last_remind_at == 0:
+            # первая точка отсчёта — от создания
+            base = req.created_at
+        else:
+            base = req.last_remind_at
 
+        if now - base >= REMIND_EVERY_SECONDS:
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Да, ещё ищу", callback_data=f"keep|{req.req_id}")],
+                [InlineKeyboardButton("❌ Нет, не актуально", callback_data=f"drop|{req.req_id}")],
+            ])
+            try:
+                await context.bot.send_message(
+                    chat_id=req.author_id,
+                    text=f"⏰ Запрос #{req.req_id} ещё актуален?\n\nНажми ДА или НЕТ.",
+                    reply_markup=kb,
+                )
+                req.awaiting_remind_answer = True
+                req.last_remind_at = now
+            except Exception:
+                pass
+
+
+# =========================
+# MAIN
+# =========================
+def build_app() -> Application:
     app = Application.builder().token(BOT_TOKEN).build()
-    app.bot_data["state"] = load_state()
 
-    # commands
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("my", cmd_my))
-    app.add_handler(CommandHandler("offer", cmd_offer))
-    app.add_handler(CommandHandler("done", cmd_done))
-    app.add_handler(CommandHandler("chats", cmd_chats))
-    app.add_handler(CommandHandler("end", cmd_end))
+    # команды
+    app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("my", my_cmd))
 
-    # callbacks
-    app.add_handler(CallbackQueryHandler(cb_router, pattern=r"^(sw|open|end)\|"))
-
-    # request conversation
-    req_conv = ConversationHandler(
-        entry_points=[CommandHandler("request", request_entry)],
+    # /request conversation
+    conv = ConversationHandler(
+        entry_points=[CommandHandler("request", request_cmd)],
         states={
-            REQ_DISTRICTS: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, request_districts)],
-            REQ_BUDGET: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, request_budget)],
-            REQ_ROOMS: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, request_rooms)],
-            REQ_TERM: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, request_term)],
-            REQ_PETS: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, request_pets)],
-            REQ_AREA: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, request_area)],
-            REQ_AMEN: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, request_amen)],
-            REQ_COMMENT: [MessageHandler(filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND, request_comment)],
-            REQ_CONFIRM: [CallbackQueryHandler(request_confirm_cb)],
+            ST_DISTRICT: [MessageHandler(filters.TEXT & ~filters.COMMAND, st_district)],
+            ST_ROOMS: [MessageHandler(filters.TEXT & ~filters.COMMAND, st_rooms)],
+            ST_BUDGET: [MessageHandler(filters.TEXT & ~filters.COMMAND, st_budget)],
+            ST_BEDROOMS: [MessageHandler(filters.TEXT & ~filters.COMMAND, st_bedrooms)],
+            ST_DISHWASHER: [MessageHandler(filters.TEXT & ~filters.COMMAND, st_dishwasher)],
+            ST_BATH: [MessageHandler(filters.TEXT & ~filters.COMMAND, st_bath)],
+            ST_OVEN: [MessageHandler(filters.TEXT & ~filters.COMMAND, st_oven)],
+            ST_AREA: [MessageHandler(filters.TEXT & ~filters.COMMAND, st_area)],
+            ST_COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, st_comment)],
         },
-        fallbacks=[],
+        fallbacks=[CommandHandler("cancel", cancel_cmd)],
         allow_reentry=True,
     )
-    app.add_handler(req_conv)
+    app.add_handler(conv)
 
-    # router catches ANY private message type except commands
-    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, private_router))
+    # callbacks
+    app.add_handler(CallbackQueryHandler(callbacks))
 
-    # cleanup job every 2 minutes
-    app.job_queue.run_repeating(cleanup_sessions, interval=120, first=120)
+    # текстовый роутер (после всего)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
 
+    return app
+
+
+async def post_init(application: Application):
+    # job_queue будет НЕ None только если requirements с [job-queue]
+    if application.job_queue:
+        application.job_queue.run_repeating(periodic_maintenance, interval=60, first=10)
+
+
+def main():
+    app = build_app()
+    app.post_init = post_init
     app.run_polling(allowed_updates=Update.ALL_TYPES)
+
 
 if __name__ == "__main__":
     main()
