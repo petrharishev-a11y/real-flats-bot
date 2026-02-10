@@ -51,3 +51,35 @@ def new_message(payload: dict):
             )
 
     return {"ok": True}
+from fastapi import FastAPI
+import os, json
+import psycopg2
+
+app = FastAPI()
+
+def get_conn():
+    return psycopg2.connect(os.environ["DATABASE_URL"])
+
+@app.get("/health")
+def health():
+    return {"ok": True}
+
+@app.post("/enqueue")
+def enqueue(payload: dict):
+    # payload пример: {"chat_id": 123456789, "text": "У вас новый отклик"}
+    chat_id = int(payload["chat_id"])
+    text = str(payload["text"])
+
+    conn = get_conn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                insert into outbox_events(type, payload, status)
+                values (%s, %s::jsonb, 'pending')
+                """,
+                ("tg_notify", json.dumps({"chat_id": chat_id, "text": text}))
+            )
+        return {"queued": True}
+    finally:
+        conn.close()
