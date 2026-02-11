@@ -9,8 +9,7 @@ DB = os.environ["DATABASE_URL"]
 API_KEY = os.environ.get("API_KEY")  # можно не ставить, но лучше
 
 def get_conn():
-    # если DB из Render internal URL — ssl обычно не нужен, но можно оставить require
-    return psycopg2.connect(DB)
+    return psycopg2.connect(DB, sslmode="require")
 
 @app.get("/health")
 def health():
