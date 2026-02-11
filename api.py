@@ -1,25 +1,24 @@
-from fastapi import FastAPI, HTTPException
 import os
+from fastapi import FastAPI, Header, HTTPException
 import psycopg2
 from psycopg2.extras import Json
 
 app = FastAPI()
 
+DB = os.environ["DATABASE_URL"]
+API_KEY = os.environ.get("API_KEY")  # можно не ставить, но лучше
+
 def get_conn():
-    db_url = os.getenv("DATABASE_URL")
-    if not db_url:
-        return None
-    return psycopg2.connect(db_url, sslmode="require")
+    # если DB из Render internal URL — ssl обычно не нужен, но можно оставить require
+    return psycopg2.connect(DB)
 
 @app.get("/health")
 def health():
     return {"ok": True}
 
 @app.post("/events/new_message")
-def new_message(payload: dict):
+def new_message(payload: dict, x_api_key: str | None = Header(default=None)):
     """
-    Минимальный MVP:
-    кладём событие в outbox_events, чтобы бот-воркер потом отправил агенту уведомление.
     payload пример:
     {
       "to_tg_user_id": 123456789,
@@ -28,58 +27,33 @@ def new_message(payload: dict):
       "startapp": "conv_12"
     }
     """
+
+    # защита (если включишь API_KEY в Render env)
+    if API_KEY and x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="unauthorized")
+
     to_tg_user_id = payload.get("to_tg_user_id")
     if not to_tg_user_id:
-        raise HTTPException(400, "to_tg_user_id required")
+        raise HTTPException(status_code=400, detail="to_tg_user_id required")
 
-    conn = get_conn()
-    if conn is None:
-        raise HTTPException(500, "DATABASE_URL not set")
+    title = payload.get("title", "Новое событие")
+    body = payload.get("body", "")
+    startapp = payload.get("startapp")
 
-    event = {
-        "to_tg_user_id": int(to_tg_user_id),
-        "title": payload.get("title", "Новое событие"),
-        "body": payload.get("body", ""),
-        "startapp": payload.get("startapp")
-    }
+    # текст, который реально уйдёт в Telegram
+    text = f"{title}\n{body}".strip()
+    if startapp:
+        text += f"\n\nОткрыть: {startapp}"
 
-    with conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO outbox_events (type, payload) VALUES (%s, %s)",
-                ("notify", Json(event)),
-            )
-
-    return {"ok": True}
-from fastapi import FastAPI
-import os, json
-import psycopg2
-
-app = FastAPI()
-
-def get_conn():
-    return psycopg2.connect(os.environ["DATABASE_URL"])
-
-@app.get("/health")
-def health():
-    return {"ok": True}
-
-@app.post("/enqueue")
-def enqueue(payload: dict):
-    # payload пример: {"chat_id": 123456789, "text": "У вас новый отклик"}
-    chat_id = int(payload["chat_id"])
-    text = str(payload["text"])
+    event = {"chat_id": int(to_tg_user_id), "text": text}
 
     conn = get_conn()
     try:
         with conn, conn.cursor() as cur:
             cur.execute(
-                """
-                insert into outbox_events(type, payload, status)
-                values (%s, %s::jsonb, 'pending')
-                """,
-                ("tg_notify", json.dumps({"chat_id": chat_id, "text": text}))
+                "INSERT INTO outbox_events (type, payload, status) VALUES (%s, %s, 'pending')",
+                ("tg_notify", Json(event)),
             )
-        return {"queued": True}
+        return {"ok": True}
     finally:
         conn.close()
